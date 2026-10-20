@@ -11,7 +11,8 @@ The goal of BonusLab is to ...
 You can install the development version of BonusLab like so:
 
 ``` r
-# FILL THIS IN! HOW CAN PEOPLE INSTALL YOUR DEV PACKAGE?
+# install.packages("pak")
+pak::pak("JonasDanielsson97/advanced-r-bonus")
 ```
 
 ## Example
