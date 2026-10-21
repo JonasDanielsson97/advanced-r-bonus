@@ -4,17 +4,19 @@ Title: What the Package Does (Title Case)
 Version: 0.1.0
 Authors@R: c(
     person(
-      "Jane", "Doe",
-      email = "jane@example.com",
+      "Jonas", "Danielsson",
+      email = "jonda228@student.liu.se",
       role = c("aut", "cre")
+    ),
+    person(
+      "Kerstin", "Arbring",
+      email = "kerar739@student.liu.se",
+      role = c("aut")
     )
   )
+  
 Description: More about what it does (maybe more than one line).
     Continuation lines should be indented.
-License: MIT + file LICENSE
+License: What license is it under?
 Encoding: UTF-8
 LazyData: true
-Suggests: 
-    testthat (>= 3.0.0)
-Config/testthat/edition: 3
-Config/roxygen2/version: 8.1.0
