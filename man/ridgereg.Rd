@@ -2,17 +2,22 @@
 % Please edit documentation in R/ridgereg.R
 \name{ridgereg}
 \alias{ridgereg}
-\title{Ridge regression}
+\title{ridgereg(formula, data, lambda)}
 \usage{
 ridgereg(formula, data, lambda)
 }
 \arguments{
-\item{formula}{A formula object.}
+\item{formula}{A ridge regression in the form  y ~ var1 + var2 ...}
 
-\item{data}{A data frame.}
+\item{data}{A data frame on which the regression will be done}
 
-\item{lambda}{The ridge penalty.}
+\item{lambda}{The ridge penalty, a single non-negative number}
+}
+\value{
+A ridgereg object
 }
 \description{
-Ridge regression
+Fits a ridge regression model using ordinary least squares. All covariates
+are normalized as \eqn{(x - \bar{x}) / \sqrt{V(x)}} before the analysis.
+The intercept is not penalized.
 }
