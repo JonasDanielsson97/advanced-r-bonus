@@ -1,3 +1,4 @@
+library(rnaturalearth) # also needs the rnaturalearthdata package to be installed
 # mean_delays <-
 #   flights_data |>
 #   # create a long format separating departure and arrival delays
