@@ -12,6 +12,7 @@ S3method(summary,linreg)
 export(linreg)
 export(pred)
 export(ridgereg)
+export(visualize_airport_delays)
 importFrom(ggplot2,
   .data,
   aes,
