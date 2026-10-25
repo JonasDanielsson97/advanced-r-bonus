@@ -1,8 +1,5 @@
 #' ridgereg(formula, data, lambda)
 #'
-#' Fits a ridge regression model using ordinary least squares. All covariates
-#' are normalized as \eqn{(x - \bar{x}) / \sqrt{V(x)}} before the analysis.
-#' The intercept is not penalized.
 #'
 #' @param formula A ridge regression in the form  y ~ var1 + var2 ...
 #' @param data A data frame on which the regression will be done
@@ -19,7 +16,7 @@ ridgereg <- function(formula, data, lambda){
             "data argument must be a data frame (or tibble)" =
               is.data.frame(data),
             "lambda argument must be a single non-negative number" =
-              is.numeric(lambda) && length(lambda) == 1 && lambda >= 0)
+              is.numeric(lambda) & length(lambda) == 1 & lambda >= 0)
 
   ### extract model
   # create a model/design matrix from the formula and data
@@ -32,7 +29,7 @@ ridgereg <- function(formula, data, lambda){
   # keep the call
   call_arg <- match.call()
 
-  ### normalize covariates (the intercept column is left as is)
+  ### normalize covariates (intercept column left as is)
   is_intercept <- colnames(X) == "(Intercept)"
   x_mean <- colMeans(X[, !is_intercept, drop = FALSE])
   x_sd <- apply(X[, !is_intercept, drop = FALSE], 2, sd)
@@ -44,7 +41,7 @@ ridgereg <- function(formula, data, lambda){
   penalty <- diag(lambda, ncol(X))
   penalty[is_intercept, is_intercept] <- 0
 
-  # beta_hat = (X^T X + lambda I)^-1 X^T y
+  # beta_hat = (X^T X + lambda I)^-1 X^T y (ridge specific)
   beta_hat <- solve(crossprod(X) + penalty, crossprod(X, y))
   rownames(beta_hat) <- colnames(X)
 
