@@ -26,7 +26,10 @@ Imports:
     nycflights13,
     USAboundaries,
     sf
-Suggests: 
+Suggests:
+    caret,
+    leaps,
+    mlbench,
     knitr,
     rmarkdown,
     testthat (>= 3.0.0)

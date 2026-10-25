@@ -16,4 +16,223 @@ knitr::opts_chunk$set(
 
 ```{r setup}
 library(BonusLab)
+library(caret)
+library(mlbench)
 ```
+
+This vignette shows how to do a simple prediction problem using the
+`ridgereg()` function together with the `caret` package. We model the median
+house value (`medv`) in the `BostonHousing` data from the `mlbench` package.
+
+## 1. Divide the data into a training and a test set
+
+```{r data}
+data("BostonHousing")
+str(BostonHousing)
+```
+
+We use `caret::createDataPartition()` to put 80% of the observations in the
+training set and the remaining 20% in the test set. The split is stratified on
+the response-variable `medv`, so both sets get a similar distribution of house values.
+
+```{r split}
+set.seed(12345)
+train_index <- createDataPartition(BostonHousing$medv, p = 0.8, list = FALSE)
+
+train_data <- BostonHousing[train_index, ]
+test_data <- BostonHousing[-train_index, ]
+
+dim(train_data)
+dim(test_data)
+```
+
+## 2. Fit a linear regression model and a model with forward selection
+
+All models in this vignette are tuned and compared with 10-fold
+cross-validation. We create the folds once and reuse them for every model, so
+all models are evaluated on exactly the same splits of the training data.
+
+```{r folds}
+set.seed(12345)
+# create folds-indexes, strata medv
+folds <- createFolds(train_data$medv, k = 10, returnTrain = TRUE)
+ # Put them into list object meant for caret::train
+ctrl <- trainControl(method = "cv", number = 10, index = folds)
+```
+
+### Linear regression
+
+The first model is an ordinary linear regression with all 13 covariates.
+
+```{r lm}
+lm_fit <- train(medv ~ ., data = train_data, method = "lm", trControl = ctrl)
+lm_fit
+```
+
+### Linear regression with forward selection
+
+For forward selection we use `method = "leapForward"` (from the `leaps`
+package). Its tuning parameter `nvmax` is the number of covariates in the
+model. By default `caret` only tries a few values of `nvmax`, so we give it
+the full grid `1:13` to make sure every model size can be selected.
+
+```{r forward}
+forward_fit <- train(medv ~ ., data = train_data, method = "leapForward",
+                     trControl = ctrl, tuneGrid = data.frame(nvmax = 1:13))
+forward_fit 
+```
+
+`leapForward` always includes at least one covariate, so the intercept-only
+model (0 covariates) is not part of the grid. We compute its cross-validated
+RMSE by hand on the same folds. The intercept-only model predicts the mean of
+the training fold for every observation in the held-out fold.
+
+```{r intercept-only}
+# Intercept only "model"
+rmse_intercept_only <- sapply(folds, function(idx) {
+  held_out <- train_data[-idx, ]
+  # RMSE = sqrt(mean((y_true - y_pred)^2)), 10-fold CV
+  sqrt(mean((held_out$medv - mean(train_data$medv[idx]))^2))
+})
+
+forward_rmse <- data.frame(
+  covariates = 0:13,
+  RMSE = c(mean(rmse_intercept_only), forward_fit$results$RMSE)
+)
+forward_rmse |> round(3)
+```
+
+The model with the lowest cross-validated RMSE among all sizes 0 to 13 is:
+
+```{r forward-best}
+forward_rmse[which.min(forward_rmse$RMSE), ] |> round(3)
+```
+
+which is the same coefficients that `caret` chose. The intercept-only model is
+far worse than all the others. The selected covariates and their coefficients
+are
+
+```{r forward-coef}
+coef(forward_fit$finalModel, forward_fit$bestTune$nvmax) |> round(3)
+```
+
+## 3. Evaluate the performance on the training set
+
+`train()` refits the selected model on the whole training.
+So we use `predict()`  to give us the fitted values on training data.
+`caret::postResample()` computes RMSE, $R^2$ and MAE from the predicted
+and observed values.
+
+```{r train-performance}
+train_performance <- rbind(
+  lm = postResample(predict(lm_fit, train_data), train_data$medv),
+  forward = postResample(predict(forward_fit, train_data), train_data$medv)
+)
+train_performance |> round(3)
+```
+
+Both models explain about 71% of the variance in `medv` on the training data.
+The full model has a slightly lower training RMSE. Which makes sense, as
+adding covariates to a linear regression can never increase the training error.
+If we look at the cross-validated RMSE from step 2, it is an
+estimate of the error on "new data", and it is higher for both models.
+
+```{r train-vs-cv}
+data.frame(
+  train_RMSE = train_performance[, "RMSE"],
+  cv_RMSE = c(lm_fit$results$RMSE, min(forward_fit$results$RMSE)),
+  row.names = c("lm", "forward")
+) |> round(3)
+```
+
+The ranking then flips. The full model is best on the training data, but the
+forward selection model is best in cross-validation.
+
+## 4. Fit ridge regression models with `ridgereg()` for different values of lambda
+
+### A custom `caret` model for `ridgereg()`
+
+`ridgereg()` is not one of the built-in models in `caret`, but `train()` also
+accepts a list that describes a custom model. The list tells `caret` what the
+tuning parameter is, how to create a default grid of values, how to fit the
+model and how to predict with it.
+
+```{r ridgereg-caret}
+ridgereg_caret <- list(
+  label = "Ridge regression with ridgereg()",
+  library = "BonusLab",
+  type = "Regression",
+  # lambda is the only tuning parameter
+  parameters = data.frame(parameter = "lambda", class = "numeric",
+                          label = "lambda"),
+  # default grid, lambda on a log scale between 0.01 and 1000
+  grid = function(x, y, len = NULL, search = "grid") {
+    if (search == "grid") {
+      data.frame(lambda = 10^seq(-2, 3, length.out = len))
+    } else {
+      data.frame(lambda = 10^stats::runif(len, min = -2, max = 3))
+    }
+  },
+  # caret gives the covariates as a matrix x and the response as a vector y
+  fit = function(x, y, wts, param, lev, last, classProbs, ...) {
+    dat <- as.data.frame(x)
+    dat$.outcome <- y
+    ridgereg(.outcome ~ ., data = dat, lambda = param$lambda)
+  },
+  predict = function(modelFit, newdata, preProc = NULL, submodels = NULL) {
+    predict(modelFit, newdata = as.data.frame(newdata))
+  },
+  prob = NULL,
+  # from the simplest model (largest lambda) to the most complex
+  sort = function(x) x[order(-x$lambda), , drop = FALSE]
+)
+```
+
+`ridgereg()` normalizes the covariates itself, so no pre-processing is needed
+in `caret`.
+
+### Fitting for different values of lambda
+
+To see what lambda does, we fit the model on the whole training set for different
+values of lambda.
+
+```{r ridgereg-lambdas}
+lambdas <- c(0, 1, 10, 100, 1000)
+
+ridge_fits <- lapply(lambdas, function(l) {
+  train(medv ~ ., data = train_data, method = ridgereg_caret,
+        # trainControl(method = "none") to fit on traindata, no cv
+        trControl = trainControl(method = "none"),
+        tuneGrid = data.frame(lambda = l))
+})
+```
+
+As lambda grows, the coefficients are shrunk towards zero.
+
+```{r ridgereg-coef}
+ridge_coef <- sapply(ridge_fits, function(fit) coef(fit$finalModel))
+dimnames(ridge_coef) <- list(colnames(coef(ridge_fits[[1]]$finalModel)),
+                             paste0("lambda=", lambdas))
+round(ridge_coef, 3)
+```
+
+With `lambda = 0` the model is an ordinary linear regression, so it has the
+same training performance as `lm_fit`. A larger lambda gives a simpler model
+with a higher training error. Whether that simpler model is better on new data
+is decided with cross-validation.
+
+```{r ridgereg-train-performance}
+sapply(ridge_fits, function(fit) {
+  postResample(predict(fit, train_data), train_data$medv)
+}) |>
+  t() |>
+  `rownames<-`(paste0("lambda=", lambdas))
+```
+
+## 5. Find the best lambda with 10-fold cross-validation
+
+<!-- TODO: caret::train() with trainControl(method = "cv", number = 10) and a lambda grid -->
+
+## 6. Evaluate all three models on the test set
+
+<!-- TODO: compare test RMSE of lm, forward selection and ridgereg + concluding comments -->

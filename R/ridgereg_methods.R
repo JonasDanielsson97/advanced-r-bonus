@@ -46,7 +46,12 @@ predict.ridgereg <-  function(object, newdata = NULL, ...){
               is.data.frame(newdata))
 
   # create a model/design matrix from newdata, the response is not needed
-  X_new <- model.matrix(delete.response(terms(object$formula)), newdata)
+  # (data = newdata is needed to expand a '.' in the formula)
+  X_new <- model.matrix(delete.response(terms(object$formula, data = newdata)), # Bugfixed
+                        newdata)
+
+  # keep the same columns, in the same order, as in the training data # Bugfixed
+  X_new <- X_new[, colnames(object$X), drop = FALSE]
 
   # normalize covariates with the mean and sd of the training data
   is_intercept <- colnames(X_new) == "(Intercept)"
