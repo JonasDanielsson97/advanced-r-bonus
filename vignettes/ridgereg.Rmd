@@ -226,13 +226,82 @@ sapply(ridge_fits, function(fit) {
   postResample(predict(fit, train_data), train_data$medv)
 }) |>
   t() |>
+  round(3) |>
   `rownames<-`(paste0("lambda=", lambdas))
 ```
 
 ## 5. Find the best lambda with 10-fold cross-validation
 
-<!-- TODO: caret::train() with trainControl(method = "cv", number = 10) and a lambda grid -->
+We now let `train()` choose lambda. It uses the same 10 folds as the models in
+step 2 (through `ctrl`), so the cross-validated errors of all three models are
+directly comparable. Then we add a tune-grid that contains `lambda = 0` (ordinary linear
+regression) and 25 values on a log scale between 0.1 and 1000.
+
+```{r ridgereg-cv}
+lambda_grid <- data.frame(lambda = c(0, 10^seq(-1, 3, length.out = 25)))
+
+# fit model, with cv 10-fold as defined in ctrl, and tuneGrid for lambda
+ridge_fit <- train(medv ~ ., data = train_data, method = ridgereg_caret,
+                   trControl = ctrl, tuneGrid = lambda_grid)
+# best lambda in grid (lowest RMSE in cross-validation)
+ridge_fit$bestTune
+```
+
+The cross-validated RMSE as a function of lambda (best lambda indicated with red line):
+
+```{r ridgereg-cv-plot, fig.width = 6, fig.height = 4}
+cv_results <- ridge_fit$results[ridge_fit$results$lambda > 0, ]
+
+ggplot2::ggplot(cv_results, ggplot2::aes(x = lambda, y = RMSE)) +
+  ggplot2::geom_line() +
+  ggplot2::geom_point() +
+  ggplot2::geom_vline(xintercept = ridge_fit$bestTune$lambda,
+                      linetype = "dashed", color = "red") + # at 15 ish
+  ggplot2::scale_x_log10() +
+  ggplot2::labs(x = "lambda (log scale)", y = "Cross-validated RMSE") +
+  ggplot2::theme_bw()
+```
+
+For small values of lambda the model is almost the same as the ordinary
+linear regression, and the curve is flat. The RMSE has a shallow minimum
+around the selected lambda, and for large values of lambda the coefficients
+are shrunk too much and the error increases quickly.
+
+`train()` has refitted the model with the best lambda on the whole training
+set. Comparing the cross-validated RMSE of the three models:
+
+```{r cv-comparison}
+data.frame(
+  model = c("lm", "forward", "ridgereg"),
+  cv_RMSE = c(min(lm_fit$results$RMSE),
+              min(forward_fit$results$RMSE),
+              min(ridge_fit$results$RMSE))
+)
+```
+
+The differences are small. Ridge regression is slightly better than the
+ordinary linear regression, but the forward selection model has the lowest
+cross-validated RMSE.
 
 ## 6. Evaluate all three models on the test set
 
-<!-- TODO: compare test RMSE of lm, forward selection and ridgereg + concluding comments -->
+For each model we use the final model that `train()` refitted on the whole
+training set, predict `medv` for the `r nrow(test_data)` observations in the
+test set and compute the RMSE with `caret::RMSE()`.
+
+```{r test-comparison}
+test_rmse <- data.frame(
+  model = c("lm", "forward", "ridgereg"),
+  test_RMSE = c(
+    RMSE(predict(lm_fit, newdata = test_data), test_data$medv),
+    RMSE(predict(forward_fit, newdata = test_data), test_data$medv),
+    RMSE(predict(ridge_fit, newdata = test_data), test_data$medv)
+  )
+)
+knitr::kable(test_rmse, digits = 3)
+```
+
+The forward selection model has the lowest test RMSE, followed closely by the
+ordinary linear regression, while the ridge regression model is slightly
+worse. This is the same winner as in the cross-validation, but ridge
+regression and the linear regression have switched places.
