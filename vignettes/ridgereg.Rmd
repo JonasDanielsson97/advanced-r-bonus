@@ -113,7 +113,7 @@ the training fold for every observation in the held-out fold.
 
 ```{r intercept-only}
 # Intercept only "model"
-# RMSE for every training-sample (10-samples in 10-fold-cv)
+# RMSE on the held-out part of each of the 10 folds
 rmse_intercept_only <- map_dbl(folds, function(training_rows) {
   held_out <- train_data[-training_rows, ]
   # for an intercept only model, the prediction is just a mean

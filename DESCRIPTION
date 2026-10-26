@@ -29,6 +29,7 @@ Imports:
 Suggests:
     caret,
     leaps,
+    MASS,
     mlbench,
     knitr,
     rmarkdown,
