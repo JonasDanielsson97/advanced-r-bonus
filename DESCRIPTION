@@ -28,6 +28,7 @@ Imports:
     sf
 Suggests:
     caret,
+    purrr,
     leaps,
     MASS,
     mlbench,

@@ -18,7 +18,8 @@ knitr::opts_chunk$set(
 library(BonusLab)
 library(caret)
 library(mlbench)
-library(tidyverse)
+library(dplyr)
+library(purrr)
 ```
 
 This vignette shows how to do a simple prediction problem using the
