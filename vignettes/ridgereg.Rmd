@@ -18,6 +18,7 @@ knitr::opts_chunk$set(
 library(BonusLab)
 library(caret)
 library(mlbench)
+library(tidyverse)
 ```
 
 This vignette shows how to do a simple prediction problem using the
@@ -71,14 +72,37 @@ lm_fit
 
 ### Linear regression with forward selection
 
-For forward selection we use `method = "leapForward"` (from the `leaps`
-package). Its tuning parameter `nvmax` is the number of covariates in the
-model. By default `caret` only tries a few values of `nvmax`, so we give it
-the full grid `1:13` to make sure every model size can be selected.
+`caret` does not implement any models itself. Every `method` string is
+the name of a small built-in wrapper that tells `train()` how to fit, predict
+and tune a model from some other package. For forward selection the wrapper is
+`method = "leapForward"`. A model
+that has no wrapper can still be used by passing a list of functions to
+`method` instead of a string, which is what we do for `ridgereg()` in
+section 4.
+
+The tuning parameter of `leapForward` is `nvmax`, the maximum number of
+covariates in the model. Since forward selection adds one covariate at a time,
+each value of `nvmax` corresponds to one model size, and cross-validation picks
+the size with the lowest RMSE. By default `train()` only evaluates
+some values of `nvmax`, so most model sizes would never be
+considered. Therefore we give it the full grid `1:13` so that every size from
+1 to 13 covariates can be selected.
+
+An alternative is `method = "glmStepAIC"`. It has no
+tuning parameter, because the covariates are chosen by AIC inside each fold
+rather than by cross-validation. For these reasons we use `leapForward`.
+
+All models supported by `caret::train()` are listed in the
+[caret documentation](https://topepo.github.io/caret/available-models.html).
 
 ```{r forward}
+# Fit forward selection model with 1 to 13 covariates
 forward_fit <- train(medv ~ ., data = train_data, method = "leapForward",
                      trControl = ctrl, tuneGrid = data.frame(nvmax = 1:13))
+
+# 
+# forward_fit <- train(medv ~ ., data = train_data, method = "glmStepAIC",
+#                      trControl = ctrl)
 forward_fit 
 ```
 
@@ -89,15 +113,20 @@ the training fold for every observation in the held-out fold.
 
 ```{r intercept-only}
 # Intercept only "model"
-rmse_intercept_only <- sapply(folds, function(idx) {
-  held_out <- train_data[-idx, ]
-  # RMSE = sqrt(mean((y_true - y_pred)^2)), 10-fold CV
-  sqrt(mean((held_out$medv - mean(train_data$medv[idx]))^2))
+# RMSE for every training-sample (10-samples in 10-fold-cv)
+rmse_intercept_only <- map_dbl(folds, function(training_rows) {
+  held_out <- train_data[-training_rows, ]
+  # for an intercept only model, the prediction is just a mean
+  prediction <- mean(train_data$medv[training_rows])
+  # RMSE = sqrt(mean((y_true - y_pred)^2))
+  sqrt(mean((held_out$medv - prediction)^2))
 })
 
+# Combining intercept model and (1:13) coef models RMSE metrics in df
 forward_rmse <- data.frame(
   covariates = 0:13,
-  RMSE = c(mean(rmse_intercept_only), forward_fit$results$RMSE)
+  RMSE = c(mean(rmse_intercept_only), # mean RMSE over the 10 folds
+          forward_fit$results$RMSE)   # have already taken the mean
 )
 forward_rmse |> round(3)
 ```
@@ -124,10 +153,14 @@ So we use `predict()`  to give us the fitted values on training data.
 and observed values.
 
 ```{r train-performance}
+# Compare training performance of lm and forward selection model
 train_performance <- rbind(
-  lm = postResample(predict(lm_fit, train_data), train_data$medv),
-  forward = postResample(predict(forward_fit, train_data), train_data$medv)
-)
+  lm = predict(lm_fit, train_data) |>   # Fitted values for lm-model on training data
+    postResample(train_data$medv),      # Compare fitted vs observed medv (target-var)
+  
+  forward = predict(forward_fit, train_data) |>
+    postResample(train_data$medv))
+
 train_performance |> round(3)
 ```
 
@@ -139,8 +172,12 @@ estimate of the error on "new data", and it is higher for both models.
 
 ```{r train-vs-cv}
 data.frame(
+  # training RMSE on full training set
   train_RMSE = train_performance[, "RMSE"],
-  cv_RMSE = c(lm_fit$results$RMSE, min(forward_fit$results$RMSE)),
+  # cross-validated RMSE from 10-fold CV
+  cv_RMSE = c(lm_fit$results$RMSE, # taken from the results of the lm_fit object
+  min(forward_fit$results$RMSE)),  # taken from the results of the forward_fit object
+
   row.names = c("lm", "forward")
 ) |> round(3)
 ```
@@ -157,7 +194,47 @@ accepts a list that describes a custom model. The list tells `caret` what the
 tuning parameter is, how to create a default grid of values, how to fit the
 model and how to predict with it.
 
+As a general template, this is the bare minimum for a custom model with one
+hyperparameter. `train()` stops with an error if any of these seven elements is
+missing, but `NULL` is allowed as a value. `my_model()`, `"mypackage"` and
+`param` are placeholders. More details are in the caret documentation on
+[using your own model in train()](https://topepo.github.io/caret/using-your-own-model-in-train.html).
+
+```{r custom-model-template, eval = FALSE}
+my_caret_model <- list(
+  # package(s) that train() loads before fitting
+  library = "mypackage",
+  type = "Regression",
+  # name of the hyperparameter, must match the column name in tuneGrid
+  parameters = data.frame(parameter = "param", class = "numeric",
+                          label = "param"),
+  # default values, only used when train() is called without tuneGrid
+  grid = function(x, y, len = NULL, search = "grid") {
+    data.frame(param = seq(0, 1, length.out = len))
+  },
+  # fit one model for one value of the hyperparameter
+  fit = function(x, y, wts, param, lev, last, classProbs, ...) {
+    dat <- as.data.frame(x)
+    dat$.outcome <- y
+    my_model(.outcome ~ ., data = dat, param = param$param)
+  },
+  # predict newdata with the model returned by fit
+  predict = function(modelFit, newdata, submodels = NULL) {
+    predict(modelFit, newdata = as.data.frame(newdata))
+  },
+  # class probabilities, NULL for regression
+  prob = NULL
+)
+```
+
+The `ridgereg()` version below fills in the template and adds a `sort`
+element. `sort` is optional. `train()` uses it to order the models from
+simplest to most complex, which matters for selection rules that prefer
+simpler models.
+
 ```{r ridgereg-caret}
+# Creating a custom caret model for ridgereg()
+# to fit criteria for the method argument in train()
 ridgereg_caret <- list(
   label = "Ridge regression with ridgereg()",
   library = "BonusLab",
@@ -199,20 +276,26 @@ values of lambda.
 ```{r ridgereg-lambdas}
 lambdas <- c(0, 1, 10, 100, 1000)
 
-ridge_fits <- lapply(lambdas, function(l) {
+# map() runs the function once for every value in lambdas and returns
+# a list with one fitted model per lambda (5 models)
+ridge_fits <- map(lambdas, function(lambda) {
   train(medv ~ ., data = train_data, method = ridgereg_caret,
-        # trainControl(method = "none") to fit on traindata, no cv
+        # method = "none" fits on all training data without cross-validation,
+        # which only allows one lambda per call
         trControl = trainControl(method = "none"),
-        tuneGrid = data.frame(lambda = l))
+        tuneGrid = data.frame(lambda = lambda))
 })
 ```
 
 As lambda grows, the coefficients are shrunk towards zero.
 
 ```{r ridgereg-coef}
-ridge_coef <- sapply(ridge_fits, function(fit) coef(fit$finalModel))
-dimnames(ridge_coef) <- list(colnames(coef(ridge_fits[[1]]$finalModel)),
-                             paste0("lambda=", lambdas))
+# coefficients for every model in ridge_fits
+ridge_coef <- map(ridge_fits, function(fit) coef(fit$finalModel)) |>
+  reduce(rbind) |>
+  t()
+
+colnames(ridge_coef) <- paste0("lambda=", lambdas)
 round(ridge_coef, 3)
 ```
 
@@ -222,12 +305,16 @@ with a higher training error. Whether that simpler model is better on new data
 is decided with cross-validation.
 
 ```{r ridgereg-train-performance}
-sapply(ridge_fits, function(fit) {
-  postResample(predict(fit, train_data), train_data$medv)
+# Calculate metrics with postResample() for every model in ridge_fit
+# lambda 0, 1, 10 ,100, 1000
+ridge_train_performance <- map(ridge_fits, function(model) {
+  predict(model, train_data) |>      # fitted values on train data
+    postResample(train_data$medv)  # Calculate metrics
 }) |>
-  t() |>
-  round(3) |>
-  `rownames<-`(paste0("lambda=", lambdas))
+  reduce(rbind) # Make lists into df
+
+rownames(ridge_train_performance) <- paste0("lambda=", lambdas)
+round(ridge_train_performance, 3)
 ```
 
 ## 5. Find the best lambda with 10-fold cross-validation
@@ -273,9 +360,13 @@ set. Comparing the cross-validated RMSE of the three models:
 ```{r cv-comparison}
 data.frame(
   model = c("lm", "forward", "ridgereg"),
-  cv_RMSE = c(min(lm_fit$results$RMSE),
-              min(forward_fit$results$RMSE),
-              min(ridge_fit$results$RMSE))
+  cv_RMSE = c(
+    # RMSE from lm (mean RMSE for the 10 models fitted in cv)
+    lm_fit$results$RMSE,
+    # Min RMSE for forward select lm 0:13 (11 was best) (RMSE is again a mean in 10-fold-cv)
+    min(forward_fit$results$RMSE),
+    # Min RMSE for different values lambda. (~14.7 was best) (RMSE is again a mean in 10-fold-cv)
+    min(ridge_fit$results$RMSE))
 )
 ```
 
