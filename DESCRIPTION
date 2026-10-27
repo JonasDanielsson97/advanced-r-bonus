@@ -1,6 +1,6 @@
 Package: BonusLab
 Type: Package
-Title: What the Package Does (Title Case)
+Title: Linear and Ridge Regression
 Version: 0.1.0
 Authors@R: c(
     person(
@@ -14,8 +14,7 @@ Authors@R: c(
       role = c("aut")
     )
   )
-Description: More about what it does (maybe more than one line).
-    Continuation lines should be indented.
+Description: Implements linear regression and ridge regression with S3 methods.
 License: MIT + file LICENSE
 Encoding: UTF-8
 LazyData: true
