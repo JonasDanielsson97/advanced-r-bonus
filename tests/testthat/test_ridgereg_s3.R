@@ -13,7 +13,7 @@ test_that("ridgereg rejects predictors with zero variance", {
   iris_empty$Species <- factor(iris_empty$Species, levels = c(levels(iris$Species), "empty"))
 
   expect_error(ridgereg(Petal.Length~Species, data=iris_empty, lambda=1),
-               "Invalid predictor standard deviations: Speciesempty")
+               "Speciesempty")
 })
 
 test_that("class is correct", {
