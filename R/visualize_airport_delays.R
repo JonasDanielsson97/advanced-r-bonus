@@ -206,7 +206,7 @@ plot_map <- function(nyc_origin) {
     })+
 
     # theme settings and labs
-    ggplot2::theme_minimal() +
+    ggplot2::theme_bw() +
     ggplot2::theme(
       legend.position = "right",
       axis.title.y = ggplot2::element_text(size = 8),
