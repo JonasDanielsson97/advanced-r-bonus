@@ -14,6 +14,337 @@ knitr::opts_chunk$set(
 )
 ```
 
+# Predicting flight delays
+
+We will use a ridge regression model to predict flight delays, more precisely flight **arrival** delays, for flights from the three New York City airports John F Kennedy Intl (JFK), Newark Liberty Intl (EWR), and La Guardia (LGA), based on flight data from 2013 in the `nycflights13` package.
+
+Design assumptions
+
+- We want to predict the destination arrival delays, i.e., our response variable will be the arrival delay, `arr_delay`
+- We will exclusively use the flights and weather data available in the `nycflights13` package to develop our model
+- The time for prediction is before, or at the latest, time for take-off.
+
+
 ```{r setup}
 library(BonusLab)
+
 ```
+
+## Flights and weather data
+
+Get flights data:
+```{r}
+flights_data_raw<-
+  nycflights13::flights
+
+flights_data_raw |> dplyr::glimpse(width=50)
+
+flights_data_raw |> 
+  dplyr::summarize(across(everything(), ~ dplyr::n_distinct(.))) |> 
+  tidyr::pivot_longer(cols = everything(), 
+                      names_to =c("variable"), values_to="unique_values") |> 
+  dplyr::arrange(dplyr::desc(unique_values))
+```
+
+Variables not present before take-off (`dep_time`, `dep_delay`, `arr_time`, `air_time`) will not be used as predictors in our model, and are therefore excluded.  
+
+Both `flight` = flight number (notably not a unique identifier for a route), and `tailnum` = a specific aircraft identifier, would be categorical variables with very high cardinality without providing useful predictive information (not generalizable and also largely redundant), and are also excluded.
+
+We observe that there is a redundancy in data when it comes to date-time: `year` carries no useful information since all data enamates from the same year, and both `year`, `month` and `day` are also present in the `time-hour` variable. Knowing that representing month-day can be tricky (especially taking into consideration that 12-31 and 01-01 actually are very close, not at a 365 distance away) we choose to represent day-of-year using a Fourier encoding, a harmonic regression with k=2 harmonics (see <https://otexts.com/fpp3/advanced.html>), which is capable of capturing annual and biannual seasonality as well as a smooth transition from New Years Eve. This will generate four variables, `doy_sin1`, `doy_cos1`, `doy_sin2`, and `doy_cos2`, but `year`, `month`, and `day` will be dropped.
+
+Turning to time variables we choose to exclude `minute` (= minute in the scheduled departure time) since that variable represents a too high granuality to be meningful. For the same reason we rename `hour` (= hour in scheduled departure time) to `hour_dep`, and extract the hour in scheduled arrival time (into `hour_arr`), and then we exclude `sched_dep_time` and `sched_arr_time.` 
+
+Keeping the `hour_dep` and `hour_arr` as numerical variables would not take into account the 24 cycle, and also a change of one hour can inlfuence arrival delays in different ways at different times of the day. The v`hour_dep` and `hour_arr` variables could alternatively be converted into factors, or be subjected to the same type of Fourier encoding as we use for day-of-year. At this stage we add both variants to the data tibble, having them ready to use for comparison.
+
+Since we will use `time-hour` for data joining it is kept for now, but will be dropped later.
+
+```{r}
+flights_data <- 
+  flights_data_raw |> 
+  dplyr::mutate(
+    doy = lubridate::yday(time_hour), # 1-365, used temporarily
+    doy_sin1 = sin(2 * pi * doy / 365),
+    doy_cos1 = cos(2 * pi * doy / 365),
+    doy_sin2 = sin(4 * pi * doy / 365),
+    doy_cos2 = cos(4 * pi * doy / 365)) |> 
+  dplyr::rename(hour_dep = hour) |> 
+  dplyr::mutate(hour_arr = (sched_arr_time %/% 100) %% 24, .after = hour_dep) |>
+  # Fourier encoding of hour variables
+    dplyr::mutate(
+    hour_dep_sin1 = sin(2 * pi * hour_dep / 24), # departure hour
+    hour_dep_cos1 = cos(2 * pi * hour_dep / 24),
+    hour_dep_sin2 = sin(4 * pi * hour_dep / 24),
+    hour_dep_cos2 = cos(4 * pi * hour_dep / 24),
+    hour_arr_sin1 = sin(2 * pi * hour_arr / 24), # arrival hour
+    hour_arr_cos1 = cos(2 * pi * hour_arr / 24),
+    hour_arr_sin2 = sin(4 * pi * hour_arr / 24),
+    hour_arr_cos2 = cos(4 * pi * hour_arr / 24)) |> 
+  # hour variables as factors
+  dplyr::mutate(hour_dep_f = factor(hour_dep),
+                hour_arr_f = factor(hour_arr)) |>
+  
+  # variable exclusion
+  dplyr::select(!c(dep_time, dep_delay, arr_time, air_time, flight, tailnum, 
+                     year, month, day, doy, minute, sched_dep_time, sched_arr_time))
+```
+
+
+Get weather data:
+```{r}
+weather_data_raw <- 
+  nycflights13::weather 
+weather_data_raw |> dplyr::glimpse(width=50)
+
+```
+
+The variables `year`, `month`, `day` and `hour` in weather_data are all excluded, since `time_hour` sufficiently identifies date-time for each observation. The weather data are overall continuous, which means we don't have any cardinality issues here.
+
+```{r}
+weather_data <- 
+  weather_data_raw |> 
+  dplyr::select(!c(year, month, day, hour))
+```
+
+
+Flights and weather data are then joined into one data set, using the common variables `origin` and `time-hour`, the latter is removed when the data sets are joined. The resulting tibble is checked for missing values (variables with zero missing values are filtered out):
+
+```{r}
+flights_and_weather_data <- 
+  flights_data |> 
+  dplyr::left_join(weather_data, by = dplyr::join_by(origin, time_hour)) |> 
+  dplyr::select(!time_hour)
+
+flights_and_weather_data |>
+  dplyr::summarize(dplyr::across(everything(), 
+                          list(missing = ~ sum(is.na(.)), 
+                               percent = ~ round(mean(is.na(.))*100, digits =1))))|>
+  tidyr::pivot_longer(cols = everything(), 
+                      names_to =c("measure",".value"), names_pattern = "^(.*)_(missing|percent)$") |>
+  dplyr::arrange(desc(missing)) |> 
+  dplyr::filter(missing>0)
+```
+
+The variable `wind_gust` is excluded due to the high proportion of missing values. Also, all rows where `arr_delay` is missing are removed since this is our response variable. 
+
+In line with how we handle day-of-year and hours, we use a sine-cosine encoding for `wind_dir`, the wind direction, in a similar way since wind directions 1° and 359° are very close, not the opposite).
+
+With the join in place, the inherently categorical variables `carrier`, `origin`, and `dest` are converted to factors. Our assessment is that this does not constitute a data leakage, since the set of carriers, origins and destinations can be retrieved from domain information, i.e., outside the current data material.
+
+```{r}
+flights_and_weather_data <-
+  flights_and_weather_data |>
+  dplyr::select(!wind_gust) |>
+  dplyr::filter(!is.na(arr_delay)) |>
+  dplyr::mutate(
+    wind_dir_sin = sin(wind_dir * pi / 180),
+    wind_dir_cos = cos(wind_dir * pi / 180)) |>
+  dplyr::select(!wind_dir) |> 
+  # categorical predictors as factors
+  dplyr::mutate(
+    carrier = factor(carrier),
+    origin = factor(origin),
+    dest = factor(dest)) 
+```
+
+## Data set partitioning
+
+The data set is split into 80% for training, 15 % for validation and 5% for test.
+
+```{r}
+set.seed(739228)
+
+# 80% training ()
+train_indices <- 
+  caret::createDataPartition(flights_and_weather_data$arr_delay, p = 0.80, list = FALSE)
+
+train_data <- flights_and_weather_data[train_indices, ]
+remaining_data <- flights_and_weather_data[-train_indices, ]
+
+# Split remaining data into validation and test
+validation_indices <- caret::createDataPartition(
+  remaining_data$arr_delay,
+  p = 0.75, # 75% out of 20% = 15%
+  list = FALSE
+)
+
+validation_data <- remaining_data[validation_indices, ]
+test_data <- remaining_data[-validation_indices, ]
+```
+
+## Imputation
+
+We re-check the now final, undivided data set for NA occurence, and then we replace NA occurences with **training** data medians in all data partitions (to avoid data leak).
+
+```{r}
+
+##### imputation helper function #####
+impute_medians <-  function(data, medians){
+  data_imp <-
+    data |>
+    dplyr::mutate(dplyr::across(dplyr::all_of(names(medians)),
+                         ~ dplyr::replace_values(., NA 
+                                            ~ medians[[dplyr::cur_column()]])))
+}
+
+# missing data check for the current full data set
+misssing_data_overview <- 
+  flights_and_weather_data |>
+  dplyr::summarize(dplyr::across(everything(), 
+                          list(missing = ~ sum(is.na(.)), 
+                               percent = ~ round(mean(is.na(.))*100, 
+                                                 digits =1)))) |>
+  tidyr::pivot_longer(cols = everything(), 
+                      names_to =c("measure",".value"), names_pattern = "^(.*)_(missing|percent)$") |>
+  dplyr::arrange(desc(missing)) |> 
+  dplyr::filter(missing>0)
+
+# compute train data medians for non-complete columns in the full data set
+train_medians <- 
+  train_data |>
+  dplyr::summarize(dplyr::across(dplyr::all_of(misssing_data_overview$measure), 
+                   ~ median(., na.rm = TRUE)))
+
+# impute
+
+train_data_imp <- 
+  impute_medians(train_data, train_medians)
+
+validation_data_imp <- 
+  impute_medians(validation_data, train_medians)
+
+test_data_imp <- 
+  impute_medians(test_data, train_medians)
+
+# imputation check, expecting no NA:s left
+sum(is.na(train_data_imp))
+sum(is.na(validation_data_imp))
+sum(is.na(test_data_imp))
+
+
+```
+
+
+## Training of ridge regression models
+
+The total set of potential predictors can be divided into the `common_predictors` and the `hour_predictors`. The `common_predictors` group will be present in all candidate models. The `hour_predictors` belong to one of three gropus: `numeric`, `factor`, or `fourier`, and only one of these groups will be used in a specific candidate model. 
+
+```{r}
+potential_predictors <- setdiff(names(train_data_imp),"arr_delay")
+
+common_predictors <- potential_predictors[
+  !startsWith(potential_predictors, "hour")
+]
+
+hour_predictors <- list(
+  numeric = c("hour_dep", "hour_arr"),
+  factor = c("hour_dep_f", "hour_arr_f"),
+  fourier = c(
+    "hour_dep_sin1", "hour_dep_cos1",
+    "hour_dep_sin2", "hour_dep_cos2",
+    "hour_arr_sin1", "hour_arr_cos1",
+    "hour_arr_sin2", "hour_arr_cos2"
+  )
+)
+```
+
+We then create three models, one each for the three hour representation groups:
+```{r}
+# create three model formulas (with each different hours representation) 
+model_formulas <- 
+  purrr::map(hour_predictors, 
+             function(hours)
+               stats::reformulate(c(common_predictors, hours),
+                                  response ="arr_delay"))
+
+model_formulas
+```
+
+The models are fitted, and then applied to the validation dataset. RMSE is then calculated for the result from predicting on the validation data set, and the min value for each .
+```{r}
+# create a lambda grid
+lambda_grid  <- 10^seq(-6, 2, length.out = 10)
+
+# for each model specification and lambda:
+# 1. fit ridge regression on the training data.
+# 2. predict arrival delays on the validation data.
+# 3. calculate validation RMSE.
+#
+# training and validation are combined in one pipe sequence, to
+# avoid storing all fitted models which is very memory consuming, 
+# 
+
+# the training and validation in one sequence,
+# limiting memory use, but slightly harder to follow
+
+validation_results <-
+  purrr::imap(model_formulas,
+              # over the three "hour" representations
+              function(f, model_name) {
+                purrr::map(lambda_grid, function(lambda) {
+                  # apply ridgereg to all lambdas
+                  # use the fit to predict on the validation data
+                  fit <- ridgereg(formula = f,
+                                data = train_data_imp,
+                                lambda = lambda)
+                  predictions <- predict(fit, newdata = validation_data_imp)
+                  tibble::tibble(model = model_name,
+                     lambda = lambda,
+                     rmse =
+                       sqrt(mean((
+                         validation_data_imp$arr_delay
+                         - as.numeric(predictions))^2)))
+                  }) |>
+                  purrr::list_rbind()
+                }) |>
+  purrr::list_rbind()
+
+validation_results |>
+  dplyr::mutate(rmse = sprintf("%.5f", rmse)) |> 
+  tidyr::pivot_wider(names_from = model, values_from = rmse) |> 
+  kableExtra::kable(title = "RMSE per hour coding and lambda")
+
+# extracting min RMSE with corresponding lambda, for each encoding type
+validation_results |>
+  dplyr::slice_min(rmse, n = 1, with_ties = FALSE, by = model) |>
+  dplyr::mutate(rmse = sprintf("%.5f", rmse)) |> 
+   kableExtra::kable(title = "Lambdas for minimum RMSE per hour coding")
+
+```
+
+Inspecting the validation results, we see very similar RMSE results for all three encodings, but we conclude that even if the difference is very small, the factor encoding consistently returns the lowest values, and thus is the best fitting variant. 
+
+We also observe that the validation RMSE remains nearly constant across a wide range of lambda values. For all three hour representations, the lowest RMSE occurs at the smallest lambda tested, suggesting that stronger regularization provides little benefit in terms of predictive accuracy.
+
+For the final fitting we use the factor representation of hours, and we also train the model on the combined train+validate data set, and we choose the very small lamba.
+
+```{r}
+# final fitting, using the combined data set and the factor representation for hours
+train_val_data <- 
+  dplyr::bind_rows(
+  train_data_imp,
+  validation_data_imp)
+
+final_model <- 
+  ridgereg(
+  formula = model_formulas$factor,
+  data = train_val_data,
+  lambda = 10^(-6)
+)
+
+```
+
+## Predicting on the test data set
+
+We now apply our fitted, final model to the so far untouched test data set, and calculate the test RMSE.
+
+```{r}
+test_predictions <- 
+  predict(final_model, newdata = test_data_imp)
+
+test_rmse <- 
+  sqrt(mean((test_data_imp$arr_delay - as.numeric(test_predictions))^2))
+
+print(paste("Test RMSE = ", test_rmse))
+```
+
+
