@@ -106,7 +106,9 @@ weather_data <-
 ```
 
 
-Flights and weather data are then joined into one data set, using the common variables `origin` and `time-hour`, the latter is removed when the data sets are joined. The resulting tibble is checked for missing values (variables with zero missing values are filtered out):
+Flights and weather data are then joined into one data set, using the common variables `origin` and `time-hour`, the latter is removed when the data sets are joined. The resulting tibble is checked for missing values (variables with zero missing values are filtered out).
+
+This join means that weather conditions at the scheduled departure time will be linked to each flight. In a real world prediction situation weather forecasts or the latest available observation would need to be used if the corresponding weather measurements are not yet available.
 
 ```{r}
 flights_and_weather_data <- 
@@ -153,7 +155,7 @@ The data set is split into 80% for training, 15 % for validation and 5% for test
 ```{r}
 set.seed(739228)
 
-# 80% training ()
+# 80% training
 train_indices <- 
   caret::createDataPartition(flights_and_weather_data$arr_delay, p = 0.80, list = FALSE)
 
@@ -173,7 +175,7 @@ test_data <- remaining_data[-validation_indices, ]
 
 ## Imputation
 
-We re-check the now final, undivided data set for NA occurence, and then we replace NA occurences with **training** data medians in all data partitions (to avoid data leak).
+We re-check the now final, undivided data set for NA occurence, and then we replace NA occurences with **training** data medians in **all** data partitions (to avoid data leak).
 
 ```{r}
 
@@ -247,19 +249,23 @@ hour_predictors <- list(
 )
 ```
 
-We then create three models, one each for the three hour representation groups:
+We then create three models, one each for the three hour encoding groups. Here we also add a potentially interesting interaction between wind speed and distance, since wind conditions could potentially affect  shorter and longer flights differently.
 ```{r}
-# create three model formulas (with each different hours representation) 
+# create three model formulas (with each different hours encoding) 
 model_formulas <- 
   purrr::map(hour_predictors, 
              function(hours)
                stats::reformulate(c(common_predictors, hours),
                                   response ="arr_delay"))
 
+model_formulas <- 
+  purrr::map(model_formulas,
+  function(f) stats::update(f,. ~ . + distance:wind_speed))
+
 model_formulas
 ```
 
-The models are fitted, and then applied to the validation dataset. RMSE is then calculated for the result from predicting on the validation data set, and the min value for each .
+The models are fitted, and then applied to the validation dataset. RMSE is then calculated for the result from predicting on the validation data set, and the minimum validation RMSE is identified for each encoding.
 ```{r}
 # create a lambda grid
 lambda_grid  <- 10^seq(-6, 2, length.out = 10)
@@ -268,17 +274,13 @@ lambda_grid  <- 10^seq(-6, 2, length.out = 10)
 # 1. fit ridge regression on the training data.
 # 2. predict arrival delays on the validation data.
 # 3. calculate validation RMSE.
-#
-# training and validation are combined in one pipe sequence, to
-# avoid storing all fitted models which is very memory consuming, 
-# 
 
 # the training and validation in one sequence,
 # limiting memory use, but slightly harder to follow
 
 validation_results <-
   purrr::imap(model_formulas,
-              # over the three "hour" representations
+              # over the three "hour" encodings
               function(f, model_name) {
                 purrr::map(lambda_grid, function(lambda) {
                   # apply ridgereg to all lambdas
@@ -298,33 +300,39 @@ validation_results <-
                 }) |>
   purrr::list_rbind()
 
+```
+
+
+```{r, tab.cap="RMSE per hour encoding group and lambda"}
 validation_results |>
   dplyr::mutate(rmse = sprintf("%.5f", rmse)) |> 
   tidyr::pivot_wider(names_from = model, values_from = rmse) |> 
-  kableExtra::kable(title = "RMSE per hour coding and lambda")
+  knitr::kable()
 
+```
+
+```{r, tab.cap="Lambdas for minimum RMSE per hour encoding group"}
 # extracting min RMSE with corresponding lambda, for each encoding type
 validation_results |>
   dplyr::slice_min(rmse, n = 1, with_ties = FALSE, by = model) |>
   dplyr::mutate(rmse = sprintf("%.5f", rmse)) |> 
-   kableExtra::kable(title = "Lambdas for minimum RMSE per hour coding")
-
+   knitr::kable()
 ```
 
-Inspecting the validation results, we see very similar RMSE results for all three encodings, but we conclude that even if the difference is very small, the factor encoding consistently returns the lowest values, and thus is the best fitting variant. 
+Inspecting the validation results, we see very similar RMSE results for all three encodings, but we conclude that even if the difference is very small, the factor encoding consistently returns the lowest values, and thus we choose it to be the best performing variant in the validation test. 
 
-We also observe that the validation RMSE remains nearly constant across a wide range of lambda values. For all three hour representations, the lowest RMSE occurs at the smallest lambda tested, suggesting that stronger regularization provides little benefit in terms of predictive accuracy.
+We also observe that the validation RMSE remains nearly constant across a wide range of lambda values. For all three hour encodings, the lowest RMSE occurs at the smallest lambda tested, suggesting that stronger regularization provides little benefit in terms of predictive accuracy.
 
-For the final fitting we use the factor representation of hours, and we also train the model on the combined train+validate data set, and we choose the very small lamba.
+For the final fitting we use the factor encoding of hours, and we also train the model on the combined train+validate data set, and we choose the very small lamba.
 
 ```{r}
-# final fitting, using the combined data set and the factor representation for hours
+# final fitting, using the combined data set and the factor encoding for hours
 train_val_data <- 
   dplyr::bind_rows(
   train_data_imp,
   validation_data_imp)
 
-final_model <- 
+final_fitted_model <- 
   ridgereg(
   formula = model_formulas$factor,
   data = train_val_data,
@@ -339,12 +347,37 @@ We now apply our fitted, final model to the so far untouched test data set, and 
 
 ```{r}
 test_predictions <- 
-  predict(final_model, newdata = test_data_imp)
+  predict(final_fitted_model, newdata = test_data_imp)
 
 test_rmse <- 
   sqrt(mean((test_data_imp$arr_delay - as.numeric(test_predictions))^2))
 
-print(paste("Test RMSE = ", test_rmse))
+test_rmse
 ```
 
+## Comparison with a mean-prediction baseline
 
+```{r}
+baseline_prediction <- mean(train_val_data$arr_delay)
+
+baseline_rmse <-
+  sqrt(mean((test_data_imp$arr_delay - baseline_prediction)^2))
+
+baseline_rmse
+
+``` 
+
+Thus our final model achieves an RMSE of approximately `r round(test_rmse, digits = 0)` minutes compared to approximately`r round(baseline_rmse, digits = 0)` minutes for the mean-prediction baseline, which suggests our ridge regression model provides a modest but measurable improvement in arrival delay predictions in comparison.
+
+
+```{r}
+y_test <- test_data_imp$arr_delay
+y_pred <- as.numeric(predict(final_fitted_model, newdata = test_data_imp))
+
+r2_test <- 
+  1 - sum((y_test - y_pred)^2) /sum((y_test - mean(y_test))^2)
+
+r2_test
+```
+
+With an $R^2_{test}$ of `r round(r2_test, digits = 2)` we conclude that the many available predictors (including the added potential interaction) in this data set still can only predict a small part of the arrival delay variation.

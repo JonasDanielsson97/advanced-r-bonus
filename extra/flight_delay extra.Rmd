@@ -353,7 +353,8 @@ design_compatibility
 # creating a lambda grid
 # lambda_grid <- 10^seq(-2, 5, length.out = 20)
 # lambda_grid_small <- 10^seq(-6, -2, length.out = 10)
-lambda_grid  <- 10^seq(-2, 5, length.out = 20)
+#lambda_grid  <- 10^seq(-2, 5, length.out = 20)
+lambda_grid  <- 10^seq(-2, 2, length.out = 4)
 
 
 validation_results <-
@@ -417,7 +418,7 @@ test_rmse <- sqrt(mean(
 test_rmse
 ```
 
-## Comparison with a nmean-prediction baseline
+## Comparison with a mean-prediction baseline
 
 ```{r}
 baseline_prediction <- mean(train_val_data$arr_delay)
@@ -501,7 +502,7 @@ glmnet_test_rmse
 ```
 
 ```{r}
-lambda <- 0.01
+lambda <- 0.000001
 
 custom_fit <- ridgereg(
   formula = model_formulas$factor,
@@ -763,3 +764,46 @@ c(
 
 ```
 
+########################################################
+
+```{r}
+fit_small <- ridgereg(
+  model_formulas$factor,
+  train_data_imp,
+  lambda = 0.01
+)
+
+fit_large <- ridgereg(
+  model_formulas$factor,
+  train_data_imp,
+  lambda = 10000
+)
+```
+
+```{r}
+c(
+  small = sum(fit_small$beta_hat[-1]^2),
+  large = sum(fit_large$beta_hat[-1]^2)
+)
+```
+
+Since our implementation standardizes predictors, we expect the sum of squared penalized coefficients to decrease as lambda increases.
+
+```{r}
+rmse <- function(fit) {
+  predictions <- as.numeric(
+    predict(fit, newdata = validation_data_imp)
+  )
+
+  sqrt(mean(
+    (validation_data_imp$arr_delay - predictions)^2
+  ))
+}
+
+c(
+  small = rmse(fit_small),
+  large = rmse(fit_large)
+)
+```
+
+If the coefficient norm decreases but RMSE remains similar, the ridge penalty is working; the predictions are simply insensitive to it.
