@@ -33,6 +33,18 @@ ridgereg <- function(formula, data, lambda){
   is_intercept <- colnames(X) == "(Intercept)"
   x_mean <- colMeans(X[, !is_intercept, drop = FALSE])
   x_sd <- apply(X[, !is_intercept, drop = FALSE], 2, sd)
+
+  ### check for zero or undefined variance before scaling
+  # a covariate with sd 0 (e.g. an empty factor level) would give 0/0 = NaN
+  variance_alert <- names(x_sd)[!(is.finite(x_sd) & x_sd > 0)]
+
+  if (length(variance_alert) > 0) {
+    stop(
+      "Invalid predictor standard deviations: ",
+      paste(variance_alert, collapse = ", ")
+    )
+  }
+
   X[, !is_intercept] <-
     scale(X[, !is_intercept, drop = FALSE], center = x_mean, scale = x_sd)
 
