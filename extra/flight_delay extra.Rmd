@@ -1,0 +1,765 @@
+---
+title: "flight_delay"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{flight_delay}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+# Predicting flight delays
+
+We will use a ridge regression model to predict flight delays, more precisely flight **arrival** delays, for flights from the three New York City airports John F Kennedy Intl (JFK), Newark Liberty Intl (EWR), and La Guardia (LGA), based on flight data from 2013 in the `nycflights13` package.
+
+Design assumptions
+
+- We want to predict the destination arrival delays, i.e., our response variable will be the arrival delay, `arr_delay`
+- We will exclusively use the flights and weather data available in the `nycflights13` package to develop our model
+- The time for prediction is before, or at the latest, time for take-off.
+
+
+```{r setup}
+library(BonusLab)
+
+```
+
+## Flights and weather data
+
+Get flights data:
+```{r}
+flights_data_raw<-
+  nycflights13::flights
+
+flights_data_raw |> dplyr::glimpse(width=50)
+
+flights_data_raw |> 
+  dplyr::summarize(across(everything(), ~ dplyr::n_distinct(.))) |> 
+  tidyr::pivot_longer(cols = everything(), 
+                      names_to =c("variable"), values_to="unique_values") |> 
+  dplyr::arrange(dplyr::desc(unique_values))
+```
+
+Variables not present before take-off (`dep_time`, `dep_delay`, `arr_time`, `air_time`) will not be used as predictors in our model, and are therefore excluded.  
+
+Both `flight` = flight number (notably not a unique identifier for a route), and `tailnum` = a specific aircraft identifier, would be categorical variables with very high cardinality without providing useful predictive information (not generalizable and also largely redundant), and are also excluded.
+
+We observe that there is a redundancy in data when it comes to date-time: `year` carries no useful information since all data enamates from the same year, and both `year`, `month` and `day` are also present in the `time-hour` variable. Knowing that representing month-day can be tricky (especially taking into consideration that 12-31 and 01-01 actually are very close, not at a 365 distance away) we choose to represent day-of-year using a Fourier encoding, a harmonic regression with k=2 harmonics (see <https://otexts.com/fpp3/advanced.html>), which is capable of capturing annual and biannual seasonality as well as a smooth transition from New Years Eve. This will generate four variables, `doy_sin1`, `doy_cos1`, `doy_sin2`, and `doy_cos2`, but `year`, `month`, and `day` will be dropped.
+
+Turning to time variables we choose to exclude `minute` (= minute in the scheduled departure time) since that variable represents a too high granuality to be meningful. For the same reason we rename `hour` (= hour in scheduled departure time) to `hour_dep`, and extract the hour in scheduled arrival time (into `hour_arr`), and then we exclude `sched_dep_time` and `sched_arr_time.` 
+
+Keeping the `hour_dep` and `hour_arr` as numerical variables would not take into account the 24 cycle, and also a change of one hour can inlfuence arrival delays in different ways at different times of the day. The v`hour_dep` and `hour_arr` variables could alternatively be converted into factors, or be subjected to the same type of Fourier encoding as we use for day-of-year. At this stage we add both variants to the data tibble, having them ready to use for comparison.
+
+Since we will use `time-hour` for data joining it is kept for now, but will be dropped later.
+
+```{r}
+flights_data <- 
+  flights_data_raw |> 
+  dplyr::mutate(
+    doy = lubridate::yday(time_hour), # 1-365, used temporarily
+    doy_sin1 = sin(2 * pi * doy / 365),
+    doy_cos1 = cos(2 * pi * doy / 365),
+    doy_sin2 = sin(4 * pi * doy / 365),
+    doy_cos2 = cos(4 * pi * doy / 365)) |> 
+  dplyr::rename(hour_dep = hour) |> 
+  dplyr::mutate(hour_arr = (sched_arr_time %/% 100) %% 24, .after = hour_dep) |>
+  # Fourier encoding of hour variables
+    dplyr::mutate(
+    hour_dep_sin1 = sin(2 * pi * hour_dep / 24), # departure hour
+    hour_dep_cos1 = cos(2 * pi * hour_dep / 24),
+    hour_dep_sin2 = sin(4 * pi * hour_dep / 24),
+    hour_dep_cos2 = cos(4 * pi * hour_dep / 24),
+    hour_arr_sin1 = sin(2 * pi * hour_arr / 24), # arrival hour
+    hour_arr_cos1 = cos(2 * pi * hour_arr / 24),
+    hour_arr_sin2 = sin(4 * pi * hour_arr / 24),
+    hour_arr_cos2 = cos(4 * pi * hour_arr / 24)) |> 
+  # hour variables as factors
+  dplyr::mutate(hour_dep_f = factor(hour_dep),
+                hour_arr_f = factor(hour_arr)) |>
+  
+  # variable exclusion
+  dplyr::select(!c(dep_time, dep_delay, arr_time, air_time, flight, tailnum, 
+                     year, month, day, doy, minute, sched_dep_time, sched_arr_time))
+```
+
+
+Get weather data:
+```{r}
+weather_data_raw <- 
+  nycflights13::weather 
+weather_data_raw |> dplyr::glimpse(width=50)
+
+```
+
+The variables `year`, `month`, `day` and `hour` in weather_data are all excluded, since `time_hour` sufficiently identifies date-time for each observation. The weather data are overall continuous, which means we don't have any cardinality issues here.
+
+```{r}
+weather_data <- 
+  weather_data_raw |> 
+  dplyr::select(!c(year, month, day, hour))
+```
+
+
+Flights and weather data are then joined into one data set, using the common variables `origin` and `time-hour`, the latter is removed when the data sets are joined. The resulting tibble is checked for missing values (variables with zero missing values are filtered out):
+
+```{r}
+flights_and_weather_data <- 
+  flights_data |> 
+  dplyr::left_join(weather_data, by = dplyr::join_by(origin, time_hour)) |> 
+  dplyr::select(!time_hour)
+
+flights_and_weather_data |>
+  dplyr::summarize(dplyr::across(everything(), 
+                          list(missing = ~ sum(is.na(.)), 
+                               percent = ~ round(mean(is.na(.))*100, digits =1))))|>
+  tidyr::pivot_longer(cols = everything(), 
+                      names_to =c("measure",".value"), names_pattern = "^(.*)_(missing|percent)$") |>
+  dplyr::arrange(desc(missing)) |> 
+  dplyr::filter(missing>0)
+```
+
+The variable `wind_gust` is excluded due to the high proportion of missing values. Also, all rows where `arr_delay` is missing are removed since this is our response variable. 
+
+In line with how we handle day-of-year and hours, we use a sine-cosine encoding for `wind_dir`, the wind direction, in a similar way since wind directions 1° and 359° are very close, not the opposite).
+
+With the join in place, the inherently categorical variables `carrier`, `origin`, and `dest` are converted to factors. Our assessment is that this does not constitute a data leakage, since the set of carriers, origins and destinations can be retrieved from domain information, i.e., outside the current data material.
+
+```{r}
+flights_and_weather_data <-
+  flights_and_weather_data |>
+  dplyr::select(!wind_gust) |>
+  dplyr::filter(!is.na(arr_delay)) |>
+  dplyr::mutate(
+    wind_dir_sin = sin(wind_dir * pi / 180),
+    wind_dir_cos = cos(wind_dir * pi / 180)) |>
+  dplyr::select(!wind_dir) |> 
+  # categorical predictors as factors
+  dplyr::mutate(
+    carrier = factor(carrier),
+    origin = factor(origin),
+    dest = factor(dest)) 
+```
+
+## Data set partitioning
+
+The data set is split into 80% for training, 15 % for validation and 5% for test.
+
+```{r}
+set.seed(739228)
+
+# 80% training ()
+train_indices <- 
+  caret::createDataPartition(flights_and_weather_data$arr_delay, p = 0.80, list = FALSE)
+
+train_data <- flights_and_weather_data[train_indices, ]
+remaining_data <- flights_and_weather_data[-train_indices, ]
+
+# Split remaining data into validation and test
+validation_indices <- caret::createDataPartition(
+  remaining_data$arr_delay,
+  p = 0.75, # 75% out of 20% = 15%
+  list = FALSE
+)
+
+validation_data <- remaining_data[validation_indices, ]
+test_data <- remaining_data[-validation_indices, ]
+```
+
+## Imputation
+
+We re-check the now final, undivided data set for NA occurence, and then we replace NA occurences with training data medians in all data partitions (to avoid data leak).
+
+```{r}
+
+##### imputation helper function #####
+impute_medians <-  function(data, medians){
+  data_imp <-
+    data |>
+    dplyr::mutate(dplyr::across(dplyr::all_of(names(medians)),
+                         ~ dplyr::replace_values(., NA 
+                                            ~ medians[[dplyr::cur_column()]])))
+}
+
+# missing data check for the current full data set
+misssing_data_overview <- 
+  flights_and_weather_data |>
+  dplyr::summarize(dplyr::across(everything(), 
+                          list(missing = ~ sum(is.na(.)), 
+                               percent = ~ round(mean(is.na(.))*100, 
+                                                 digits =1)))) |>
+  tidyr::pivot_longer(cols = everything(), 
+                      names_to =c("measure",".value"), names_pattern = "^(.*)_(missing|percent)$") |>
+  dplyr::arrange(desc(missing)) |> 
+  dplyr::filter(missing>0)
+
+# compute train data medians for non-complete columns in the full data set
+train_medians <- 
+  train_data |>
+  dplyr::summarize(dplyr::across(dplyr::all_of(misssing_data_overview$measure), 
+                   ~ median(., na.rm = TRUE)))
+
+# impute
+
+train_data_imp <- 
+  impute_medians(train_data, train_medians)
+
+validation_data_imp <- 
+  impute_medians(validation_data, train_medians)
+
+test_data_imp <- 
+  impute_medians(test_data, train_medians)
+
+# imputation check, expecting no NA:s left
+sum(is.na(train_data_imp))
+sum(is.na(validation_data_imp))
+sum(is.na(test_data_imp))
+
+# XXXXX
+
+
+```
+
+
+## Training of ridge regression models
+
+
+```{r}
+#ridgereg_KA
+
+ridgereg <- function(formula, data, lambda){
+
+  stopifnot("formula argument must be formula object" =
+              inherits(formula, "formula"),
+            "data argument must be a data frame (or tibble)" =
+              is.data.frame(data),
+            "lambda argument must be a single non-negative number" =
+              is.numeric(lambda) && length(lambda) == 1 && lambda >= 0)
+
+  ### extract model
+  # create a model/design matrix from the formula and data
+  X <- model.matrix(formula, data) # independent variables
+
+  # extract the depedent variable from data using formula names
+  y_name <- all.vars(formula)[1]
+  y <- data[[y_name]]
+
+  # keep the call
+  call_arg <- match.call()
+
+  ### normalize covariates (the intercept column is left as is)
+  is_intercept <- colnames(X) == "(Intercept)"
+  x_mean <- colMeans(X[, !is_intercept, drop = FALSE])
+  x_sd <- apply(X[, !is_intercept, drop = FALSE], 2, sd)
+
+  ############
+
+  invalid_sd <- !is.finite(x_sd) | x_sd == 0
+
+  if (any(invalid_sd)) {
+    stop(
+      "Cannot standardize predictors with zero or invalid SD: ",
+      paste(names(x_sd)[invalid_sd], collapse = ", ")
+    )
+  }
+
+  ############
+  X[, !is_intercept] <-
+    scale(X[, !is_intercept, drop = FALSE], center = x_mean, scale = x_sd)
+
+  ### calculate ridge regression statistics (least squares)
+  # penalty matrix, lambda * I with no penalty on the intercept
+  penalty <- diag(lambda, ncol(X))
+  penalty[is_intercept, is_intercept] <- 0
+
+  # beta_hat = (X^T X + lambda I)^-1 X^T y
+  beta_hat <- solve(crossprod(X) + penalty, crossprod(X, y))
+  rownames(beta_hat) <- colnames(X)
+
+  # y_hat = fitted values
+  y_hat <- X %*% beta_hat
+
+  ### create a ridgereg object
+  ridgereg_obj <-
+    structure(
+      list(
+        formula = formula,
+        call_arg = call_arg,
+        lambda = lambda,
+        X = X,
+        y = y,
+        y_name = y_name,
+        x_mean = x_mean,
+        x_sd = x_sd,
+        beta_hat = beta_hat,
+        y_hat = y_hat),
+      class = "ridgereg")
+
+  return(ridgereg_obj)
+}
+
+```
+
+```{r}
+
+potential_predictors <- setdiff(names(train_data_imp),"arr_delay")
+
+common_predictors <- potential_predictors[
+  !startsWith(potential_predictors, "hour")
+]
+
+hour_predictors <- list(
+  numeric = c("hour_dep", "hour_arr"),
+  factor = c("hour_dep_f", "hour_arr_f"),
+  fourier = c(
+    "hour_dep_sin1", "hour_dep_cos1",
+    "hour_dep_sin2", "hour_dep_cos2",
+    "hour_arr_sin1", "hour_arr_cos1",
+    "hour_arr_sin2", "hour_arr_cos2"
+  )
+)
+
+# create three model formulas (with each different hours representation) 
+model_formulas <- 
+  purrr::map(hour_predictors, 
+             function(hours)
+               stats::reformulate(c(common_predictors, hours),
+                                  response ="arr_delay"))
+
+# checking the design matrices have the same order of predictor columns, 
+# and all rows retained
+design_compatibility <- 
+  purrr::map(
+  model_formulas,
+  function(f) {
+    X_train <- stats::model.matrix(f, train_data_imp)
+    X_val   <- stats::model.matrix(f, validation_data_imp)
+    X_test  <- stats::model.matrix(f, test_data_imp)
+
+    c(validation = identical(colnames(X_train), colnames(X_val)),
+      test = identical(colnames(X_train), colnames(X_test)),
+      train_rows = nrow(X_train) == nrow(train_data_imp),
+      validation_rows = nrow(X_val) == nrow(validation_data_imp),
+      test_rows = nrow(X_test) == nrow(test_data_imp))
+  })
+
+design_compatibility
+
+# creating a lambda grid
+# lambda_grid <- 10^seq(-2, 5, length.out = 20)
+# lambda_grid_small <- 10^seq(-6, -2, length.out = 10)
+lambda_grid  <- 10^seq(-2, 5, length.out = 20)
+
+
+validation_results <-
+  purrr::imap(model_formulas, 
+              # over the three hour s representations
+              function(f, model_name) {
+                purrr::map(lambda_grid, function(lambda) {
+                  # applying ridgereg to all lambdas
+                  # use the fit to predict on the validation data
+                  fit <- ridgereg(formula = f,
+                                data = train_data_imp,
+                                lambda = lambda)
+                  predictions <- predict(fit, newdata = validation_data_imp)
+                  tibble::tibble(model = model_name,
+                     lambda = lambda,
+                     rmse = 
+                       sqrt(mean((
+                         validation_data_imp$arr_delay 
+                         - as.numeric(predictions))^2)))
+                  }) |>
+                  purrr::list_rbind()
+                }) |>
+  purrr::list_rbind()
+
+validation_results |>
+    dplyr::mutate(
+        rmse = sprintf("%.5f", rmse)
+    ) |>
+    print(n = 60)
+
+#
+# final fitting, using the combined data set and the factor representation for hours
+train_val_data <- 
+  dplyr::bind_rows(
+  train_data_imp,
+  validation_data_imp)
+
+final_model <- 
+  ridgereg(
+  formula = model_formulas$factor,
+  data = train_val_data,
+  lambda = 0.01
+)
+
+```
+
+
+## Prediction on the test data set
+
+
+```{r}
+test_predictions <- predict(
+  final_model,
+  newdata = test_data_imp
+)
+
+test_rmse <- sqrt(mean(
+  (test_data_imp$arr_delay - as.numeric(test_predictions))^2
+))
+
+test_rmse
+```
+
+## Comparison with a nmean-prediction baseline
+
+```{r}
+baseline_prediction <- mean(train_val_data$arr_delay)
+
+baseline_rmse <- sqrt(mean(
+  (test_data_imp$arr_delay - baseline_prediction)^2
+))
+
+baseline_rmse
+
+
+100 * (baseline_rmse - test_rmse) / baseline_rmse
+
+test_r2 <- 1 - test_rmse^2 / baseline_rmse^2
+
+test_r2
+```
+
+```{r}
+#' Extract ridge regression coefficients
+#'
+#' @param object An object of class ridgereg
+#' @param ... Additional arguments for compatibility with the generic
+#'
+#' @return A named numeric vector of regression coefficients
+#'
+#' @export
+coef.ridgereg <- function(object, ...) {
+  stats::setNames(
+    as.numeric(object$beta_hat),
+    rownames(object$beta_hat)
+  )
+}
+
+tibble::enframe(
+  coef(final_model),
+  name = "predictor",
+  value = "estimate"
+) |>
+  dplyr::arrange(dplyr::desc(abs(estimate)))
+
+```
+
+```{r}
+library(glmnet)
+
+set.seed(739228)
+
+# Use the same training observations
+x_train <- stats::model.matrix(
+  model_formulas$factor, train_val_data
+)[, -1]
+
+y_train <- train_val_data$arr_delay
+
+x_test <- stats::model.matrix(
+  model_formulas$factor, test_data_imp
+)[, -1]
+
+# Cross-validate glmnet on training + validation only
+set.seed(739228)
+
+cv_model <- glmnet::cv.glmnet(
+  x_train, y_train,
+  alpha = 0,
+  nfolds = 10
+)
+
+# Evaluate on the untouched test set
+glmnet_predictions <- predict(
+  cv_model,
+  newx = x_test,
+  s = "lambda.min"
+)
+
+glmnet_test_rmse <- sqrt(mean(
+  (test_data_imp$arr_delay - as.numeric(glmnet_predictions))^2
+))
+
+glmnet_test_rmse
+```
+
+```{r}
+lambda <- 0.01
+
+custom_fit <- ridgereg(
+  formula = model_formulas$factor,
+  data = train_val_data,
+  lambda = lambda
+)
+
+mass_fit <- MASS::lm.ridge(
+  formula = model_formulas$factor,
+  data = train_val_data,
+  lambda = lambda
+)
+
+##################
+lambda_grid_mini <- 10^seq(-2, 2, length.out = 4)
+allofthem <- purrr::map(lambda_grid_mini, function(lambda) {MASS::lm.ridge(
+  formula = model_formulas$factor,
+  data = train_val_data,
+  lambda = lambda)
+  })
+
+##################
+mass_coef <- stats::coef(mass_fit)
+
+custom_coef_scaled <- as.numeric(custom_fit$beta_hat)
+names(custom_coef_scaled) <- rownames(custom_fit$beta_hat)
+
+custom_coef <- custom_coef_scaled
+
+predictor_names <- names(custom_fit$x_sd)
+
+custom_coef[predictor_names] <-
+  custom_coef_scaled[predictor_names] / custom_fit$x_sd
+
+custom_coef["(Intercept)"] <-
+  custom_coef_scaled["(Intercept)"] -
+  sum(custom_coef[predictor_names] * custom_fit$x_mean)
+
+names(mass_coef)[names(mass_coef) == ""] <- "(Intercept)"
+
+comparison <- tibble::tibble(
+  predictor = names(custom_coef),
+  custom = as.numeric(custom_coef),
+  MASS = as.numeric(mass_coef[names(custom_coef)])
+) |>
+  dplyr::mutate(
+    difference = custom - MASS
+  )
+
+comparison |>
+  dplyr::arrange(dplyr::desc(abs(difference))) |>
+  print(n = 20)
+
+max(abs(comparison$difference))
+
+##########################################################
+
+comparison |>
+  dplyr::mutate(
+    group = dplyr::case_when(
+      startsWith(predictor, "hour_dep_f") ~ "Departure hour",
+      startsWith(predictor, "hour_arr_f") ~ "Arrival hour",
+      predictor == "(Intercept)" ~ "Intercept",
+      TRUE ~ "Other"
+    )
+  ) |>
+  dplyr::group_by(group) |>
+  dplyr::summarise(
+    min_diff = min(difference),
+    max_diff = max(difference),
+    .groups = "drop"
+  )
+
+
+#########################################################
+# Predictions from our custom implementation
+custom_pred <- as.numeric(custom_fit$y_hat)
+
+# Predictions from MASS using its original-scale coefficients
+X <- stats::model.matrix(
+  model_formulas$factor,
+  data = train_val_data
+)
+
+mass_pred <- as.numeric(
+  X %*% mass_coef[colnames(X)]
+)
+
+# Maximum prediction difference
+max(abs(custom_pred - mass_pred))
+
+# RMSE between the two sets of predictions
+sqrt(mean((custom_pred - mass_pred)^2))
+
+#########################################################
+##### OLS comparison #####
+custom_ols <- ridgereg(
+  model_formulas$factor,
+  train_val_data,
+  lambda = 0
+)
+
+mass_ols <- MASS::lm.ridge(
+  model_formulas$factor,
+  train_val_data,
+  lambda = 0
+)
+
+custom_ols_coef <- as.numeric(custom_ols$beta_hat)
+names(custom_ols_coef) <- rownames(custom_ols$beta_hat)
+
+predictor_names <- names(custom_ols$x_sd)
+
+custom_ols_coef[predictor_names] <-
+  custom_ols_coef[predictor_names] / custom_ols$x_sd
+
+custom_ols_coef["(Intercept)"] <-
+  custom_ols_coef["(Intercept)"] -
+  sum(custom_ols_coef[predictor_names] * custom_ols$x_mean)
+
+mass_ols_coef <- stats::coef(mass_ols)
+names(mass_ols_coef)[names(mass_ols_coef) == ""] <- "(Intercept)"
+
+ols_comparison <- tibble::tibble(
+  predictor = names(custom_ols_coef),
+  custom = as.numeric(custom_ols_coef),
+  MASS = as.numeric(mass_ols_coef[names(custom_ols_coef)])
+) |>
+  dplyr::mutate(difference = custom - MASS)
+
+max(abs(ols_comparison$difference))
+
+X <- stats::model.matrix(
+  model_formulas$factor,
+  data = train_val_data
+)
+
+custom_ols_pred <- as.numeric(custom_ols$y_hat)
+
+mass_ols_pred <- as.numeric(
+  X %*% mass_ols_coef[colnames(X)]
+)
+
+c(
+  max_abs_diff = max(abs(custom_ols_pred - mass_ols_pred)),
+  rmse_diff = sqrt(mean((custom_ols_pred - mass_ols_pred)^2))
+)
+
+X <- stats::model.matrix(
+  model_formulas$factor,
+  data = train_val_data
+)
+
+c(
+  columns = ncol(X),
+  rank = qr(X)$rank
+)
+#########################################################
+##### lm comparison #####
+
+lm_fit <- stats::lm(
+  model_formulas$factor,
+  data = train_val_data
+)
+
+lm_pred <- as.numeric(stats::fitted(lm_fit))
+
+c(
+  custom_vs_lm = sqrt(mean(
+    (custom_ols_pred - lm_pred)^2
+  )),
+  MASS_vs_lm = sqrt(mean(
+    (mass_ols_pred - lm_pred)^2
+  ))
+)
+
+caret::findLinearCombos(X)
+```
+
+
+```{r}
+train_val_data_imp <- 
+  dplyr::bind_rows(
+  train_data_imp,
+  validation_data_imp)
+
+train_val_test_data_imp <- 
+  dplyr::bind_rows(
+  train_data_imp,
+  validation_data_imp,
+  test_data_imp)
+
+X_train_num <- stats::model.matrix(model_formulas$numeric, train_data_imp)
+X_val_num   <- stats::model.matrix(model_formulas$numeric, validation_data_imp)
+X_test_num  <- stats::model.matrix(model_formulas$numeric, test_data_imp)
+X_train_val_num <- stats::model.matrix(model_formulas$numeric, train_val_data_imp)
+X_train_val_test_num <- stats::model.matrix(model_formulas$numeric, train_val_test_data_imp)
+    
+X_train_factor <- stats::model.matrix(model_formulas$factor, train_data_imp)
+X_val_factor   <- stats::model.matrix(model_formulas$factor, validation_data_imp)
+X_test_factor  <- stats::model.matrix(model_formulas$factor, test_data_imp)
+X_train_val_factor <- stats::model.matrix(model_formulas$factor, train_val_data_imp)
+X_train_val_test_factor <- stats::model.matrix(model_formulas$factor, train_val_test_data_imp)
+    
+X_train_fourier <- stats::model.matrix(model_formulas$fourier, train_data_imp)
+X_val_fourier   <- stats::model.matrix(model_formulas$fourier, validation_data_imp)
+X_test_fourier  <- stats::model.matrix(model_formulas$fourier, test_data_imp)
+X_train_val_fourier <- stats::model.matrix(model_formulas$fourier, train_val_data_imp)
+X_train_val_test_fourier <- stats::model.matrix(model_formulas$fourier, train_val_test_data_imp)
+    
+caret::findLinearCombos(X_train_num)
+caret::findLinearCombos(X_val_num)
+caret::findLinearCombos(X_test_num)
+caret::findLinearCombos(X_train_val_num)
+caret::findLinearCombos(X_train_val_test_num)
+
+caret::findLinearCombos(X_train_factor)
+caret::findLinearCombos(X_val_factor)
+caret::findLinearCombos(X_test_factor)
+caret::findLinearCombos(X_train_val_factor)
+caret::findLinearCombos(X_train_val_test_factor)
+
+caret::findLinearCombos(X_train_fourier)
+caret::findLinearCombos(X_val_fourier)
+caret::findLinearCombos(X_test_fourier)
+caret::findLinearCombos(X_train_val_fourier)
+caret::findLinearCombos(X_train_val_test_fourier)
+
+
+
+# which columns?
+colnames(X_train_val_factor)[
+  caret::findLinearCombos(X_train_val_factor)$remove
+]
+
+# Zero observations?
+colSums(abs(X_train_val_factor[
+  , caret::findLinearCombos(X_train_val_factor)$remove,
+  drop = FALSE
+]))
+
+```
+
+```{r}
+train_val_data_reduced <- train_val_data
+
+train_val_data_reduced$hour_dep_f <-
+    droplevels(train_val_data$hour_dep_f)
+
+X_reduced <- stats::model.matrix(
+  model_formulas$factor,
+  data = train_val_data_reduced
+)
+
+c(
+  columns = ncol(X_reduced),
+  rank = qr(X_reduced)$rank
+)
+
+```
+

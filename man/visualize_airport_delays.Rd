@@ -3,28 +3,30 @@
 \name{visualize_airport_delays}
 \alias{visualize_airport_delays}
 \title{Visualization of mean airport delays
-This function uses the nycflights13 package 
+This function uses the nycflights13 package
 <https://github.com/tidyverse/nycflights13">
 providing data on flight schedule deviations
 for flights originating in one of the three New York City airports.
 Foocusing on arrival delays, destination airport mean arrival delay times
-are displayed on a color scale. 
+are displayed on a color scale.
 Note: Mean delay times are calculated with early arrivals set to 0,
 since early arrivals are not mitigating actual delays}
 \usage{
 visualize_airport_delays()
 }
 \value{
-A map plot
+A list of five plots: one map plot for arrival delays for each
+of the NYC airports, one for them treated as one origin airport,
+and one with the previous four plots combined.
 }
 \description{
 Visualization of mean airport delays
-This function uses the nycflights13 package 
+This function uses the nycflights13 package
 <https://github.com/tidyverse/nycflights13">
 providing data on flight schedule deviations
 for flights originating in one of the three New York City airports.
 Foocusing on arrival delays, destination airport mean arrival delay times
-are displayed on a color scale. 
+are displayed on a color scale.
 Note: Mean delay times are calculated with early arrivals set to 0,
 since early arrivals are not mitigating actual delays
 }
