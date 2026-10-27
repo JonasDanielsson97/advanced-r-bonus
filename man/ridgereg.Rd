@@ -17,7 +17,5 @@ ridgereg(formula, data, lambda)
 A ridgereg object
 }
 \description{
-Fits a ridge regression model using ordinary least squares. All covariates
-are normalized as \eqn{(x - \bar{x}) / \sqrt{V(x)}} before the analysis.
-The intercept is not penalized.
+ridgereg(formula, data, lambda)
 }
